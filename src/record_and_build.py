@@ -6,9 +6,28 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 
+OUTPUT_DIR = "Working"
+OUTPUT_FILE = "nptel_multi_quiz_offline.html"
+FAVICON_FILE = "favicon.png"
+
+
+def favicon_extension(content_type: str) -> str:
+    """Choose a browser-friendly extension for the downloaded icon."""
+    content_type = content_type.lower().split(";", 1)[0].strip()
+    return {
+        "image/png": "png",
+        "image/svg+xml": "svg",
+        "image/x-icon": "ico",
+        "image/vnd.microsoft.icon": "ico",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+    }.get(content_type, "ico")
+
+
 async def main():
     recorded_quizzes = {}
     keep_recording = True
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     async def background_recorder(page):
         """Polls the browser URL from Python every second to record new quizzes."""
@@ -140,8 +159,37 @@ async def main():
             container_el["id"] = "nptel-offline-display"
 
         # 3. Local CSS Asset Downloader
-        assets_dir = "assets"
+        assets_dir = os.path.join(OUTPUT_DIR, "assets")
         os.makedirs(assets_dir, exist_ok=True)
+
+        # Download the course favicon so the saved file does not depend on the
+        # original website. Keep the existing local icon if this request fails.
+        favicon_name = FAVICON_FILE
+        favicon_mime = "image/png"
+        try:
+            favicon_url = await page.evaluate(
+                """() => document.querySelector('link[rel~="icon"]')?.href
+                    || new URL('/favicon.ico', location.origin).href"""
+            )
+            favicon_response = await context.request.get(favicon_url)
+            if favicon_response.status == 200:
+                favicon_mime = favicon_response.headers.get("content-type", "image/x-icon")
+                favicon_name = f"favicon.{favicon_extension(favicon_mime)}"
+                with open(os.path.join(OUTPUT_DIR, favicon_name), "wb") as f:
+                    f.write(await favicon_response.body())
+                print(f"  [+] Downloaded favicon: '{favicon_name}'")
+        except Exception as error:
+            print(f"  [!] Could not download favicon; keeping local fallback: {error}")
+
+        # Always use the favicon stored next to this offline HTML file.
+        if soup.head:
+            for icon in soup.head.find_all("link", rel=lambda value: value and "icon" in value):
+                icon.decompose()
+            favicon = soup.new_tag(
+                "link", rel="icon", type=favicon_mime, href=f"./{favicon_name}"
+            )
+            soup.head.insert(0, favicon)
+
         css_tags = soup.find_all("link", rel="stylesheet")
         for idx, tag in enumerate(css_tags):
             href = tag.get("href")
@@ -271,7 +319,7 @@ async def main():
         if soup.body:
             soup.body.append(router_js)
 
-        output_file = "nptel_multi_quiz_offline.html"
+        output_file = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
