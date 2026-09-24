@@ -8,6 +8,7 @@ from playwright.async_api import async_playwright
 
 OUTPUT_DIR = "Working"
 OUTPUT_FILE = "nptel_multi_quiz_offline.html"
+PROGRESS_OUTPUT_FILE = "nptel_course_progress_offline.html"
 FAVICON_FILE = "favicon.png"
 
 
@@ -28,6 +29,70 @@ async def main():
     recorded_quizzes = {}
     keep_recording = True
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    async def click_visible_text(page, text: str) -> bool:
+        """Click an on-screen control, never a hidden duplicate from the SPA."""
+        locator = page.get_by_text(text, exact=True)
+        for index in range(await locator.count()):
+            candidate = locator.nth(index)
+            if await candidate.is_visible():
+                await candidate.click(timeout=5_000)
+                return True
+        return False
+
+    def make_file_link(soup, label: str, filename: str):
+        """Turn a captured React-only control into a working local file link."""
+        for text_node in soup.find_all(
+            string=lambda value: value and value.strip() == label
+        ):
+            control = text_node.parent
+            control.name = "a"
+            control["href"] = f"./{filename}"
+            control["onclick"] = ""
+
+    async def capture_all_outline_panels(page):
+        """Load each lazy sidebar week and retain its rendered lesson panel."""
+        outline_buttons = page.locator(
+            'nav[aria-label="Course outline"] button[aria-controls^="unit-"]'
+        )
+        panels = {}
+        for index in range(await outline_buttons.count()):
+            button = outline_buttons.nth(index)
+            if not await button.is_visible():
+                continue
+            panel_id = await button.get_attribute("aria-controls")
+            if not panel_id:
+                continue
+            await button.click(timeout=5_000)
+            panel = page.locator(f"#{panel_id}")
+            try:
+                await panel.wait_for(state="attached", timeout=5_000)
+                await page.wait_for_function(
+                    """id => {
+                        const element = document.getElementById(id);
+                        return element && element.textContent.trim().length > 0;
+                    }""",
+                    panel_id,
+                    timeout=5_000,
+                )
+                panels[panel_id] = await panel.evaluate("element => element.outerHTML")
+            except Exception:
+                print(f"  [!] Could not load sidebar panel '{panel_id}'.")
+        print(f"  [+] Captured {len(panels)} sidebar lesson panels.")
+        return panels
+
+    def restore_outline_panels(soup, panels):
+        """Insert lazy React panels that were absent from page.content()."""
+        for panel_id, panel_html in panels.items():
+            header = soup.select_one(f'button[aria-controls="{panel_id}"]')
+            replacement = BeautifulSoup(panel_html, "html.parser").find()
+            if header is None or replacement is None:
+                continue
+            existing = soup.find(id=panel_id)
+            if existing:
+                existing.replace_with(replacement)
+            else:
+                header.insert_after(replacement)
 
     async def background_recorder(page):
         """Polls the browser URL from Python every second to record new quizzes."""
@@ -117,8 +182,29 @@ async def main():
         await recorder_task
 
         print(f"\nCaptured {len(recorded_quizzes)} quizzes. Building offline file...")
-        raw_html = await page.content()
+        # Capture both views on separate, fresh pages. Their React layouts are
+        # different, so embedding one inside the other breaks both sidebars.
+        course_capture = await context.new_page()
+        await course_capture.goto(target_url, wait_until="networkidle")
+        await course_capture.wait_for_timeout(1_000)
+        outline_panels = await capture_all_outline_panels(course_capture)
+        raw_html = await course_capture.content()
+
+        progress_capture = await context.new_page()
+        progress_url = "https://onlinecourses.nptel.ac.in/e-learning/progress/noc26_cs180"
+        await progress_capture.goto(progress_url, wait_until="networkidle")
+        await progress_capture.get_by_text(
+            "Student Progress Report", exact=True
+        ).first.wait_for(state="visible", timeout=15_000)
+        # Save scores expanded, so the offline progress page is useful without
+        # relying on the live React accordion handlers.
+        await click_visible_text(progress_capture, "Assignment Scores")
+        await progress_capture.wait_for_timeout(500)
+        progress_raw_html = await progress_capture.content()
+
         soup = BeautifulSoup(raw_html, "html.parser")
+        restore_outline_panels(soup, outline_panels)
+        progress_soup = BeautifulSoup(progress_raw_html, "html.parser")
 
         # 1. Offline sidebar styling. Do not force collapsed accordions open:
         # it breaks the original responsive layout and creates empty gaps.
@@ -151,12 +237,26 @@ async def main():
         if soup.head:
             soup.head.append(override_style)
 
-        # 2. Tag target container explicitly
-        container_el = soup.select_one(
-            '#course-content, .lesson-container, .main-content, main, [role="main"]'
-        )
+        # 2. The course page has no stable <main> node. Use the right-hand
+        # course card rather than document.body, preserving its sidebar and
+        # header whenever an offline quiz is opened.
+        container_el = None
+        layout_root = soup.select_one(".layout-root")
+        if layout_root:
+            sidebar_el = layout_root.select_one(":scope > .Sidebar")
+            for child in layout_root.find_all(recursive=False):
+                if child is not sidebar_el:
+                    container_el = child
+                    break
+        if container_el is None:
+            container_el = soup.select_one(
+                '#course-content, .lesson-container, .main-content, main, [role="main"]'
+            )
         if container_el:
             container_el["id"] = "nptel-offline-display"
+
+        make_file_link(soup, "Course Progress", PROGRESS_OUTPUT_FILE)
+        make_file_link(progress_soup, "← Back to Course Outline", OUTPUT_FILE)
 
         # 3. Local CSS Asset Downloader
         assets_dir = os.path.join(OUTPUT_DIR, "assets")
@@ -167,7 +267,7 @@ async def main():
         favicon_name = FAVICON_FILE
         favicon_mime = "image/png"
         try:
-            favicon_url = await page.evaluate(
+            favicon_url = await course_capture.evaluate(
                 """() => document.querySelector('link[rel~="icon"]')?.href
                     || new URL('/favicon.ico', location.origin).href"""
             )
@@ -189,6 +289,12 @@ async def main():
                 "link", rel="icon", type=favicon_mime, href=f"./{favicon_name}"
             )
             soup.head.insert(0, favicon)
+        if progress_soup.head:
+            for icon in progress_soup.head.find_all("link", rel=lambda value: value and "icon" in value):
+                icon.decompose()
+            progress_soup.head.insert(0, progress_soup.new_tag(
+                "link", rel="icon", type=favicon_mime, href=f"./{favicon_name}"
+            ))
 
         css_tags = soup.find_all("link", rel="stylesheet")
         for idx, tag in enumerate(css_tags):
@@ -207,7 +313,26 @@ async def main():
             except Exception:
                 pass
 
+        progress_css_tags = progress_soup.find_all("link", rel="stylesheet")
+        for idx, tag in enumerate(progress_css_tags):
+            href = tag.get("href")
+            if not href:
+                continue
+            abs_css = urljoin(progress_url, href)
+            css_name = f"progress_style_{idx}.css"
+            local_css = os.path.join(assets_dir, css_name)
+            try:
+                res = await context.request.get(abs_css)
+                if res.status == 200:
+                    with open(local_css, "w", encoding="utf-8") as f:
+                        f.write(await res.text())
+                    tag["href"] = f"./assets/{css_name}"
+            except Exception:
+                pass
+
         for base in soup.find_all("base"):
+            base.decompose()
+        for base in progress_soup.find_all("base"):
             base.decompose()
 
         # 4. Store payload as JSON, never as JavaScript source. Escaping `</`
@@ -275,7 +400,12 @@ async def main():
                 });
 
                 function setSectionState(button, expanded) {
-                    const panel = document.getElementById(button.getAttribute('aria-controls'));
+                    const panelId = button.getAttribute('aria-controls');
+                    // Unit panels are immediate siblings in the saved outline.
+                    // Prefer that local relationship so duplicated SPA IDs or
+                    // stale React markup cannot make a week appear empty.
+                    const panel = button.nextElementSibling
+                        || (panelId && document.getElementById(panelId));
                     button.setAttribute('aria-expanded', String(expanded));
                     const icon = button.querySelector('svg');
                     icon?.classList.toggle('rotate-90', expanded);
@@ -285,20 +415,28 @@ async def main():
                     }
                 }
 
-                // Start with a clean, compact outline. Captured pages can retain
-                // stale aria/class state from the live React application.
+                // Preserve the old, working compact sidebar: every week starts
+                // closed and clicking its header expands its own saved content.
                 document.querySelectorAll('button[aria-controls^="unit-"]').forEach(button => {
                     setSectionState(button, false);
                 });
 
                 document.addEventListener('click', event => {
-                    const target = event.target.closest('button, a');
-                    if (!target) return;
-
-                    if (target.matches('button[aria-controls^="unit-"]')) {
-                        setSectionState(target, target.getAttribute('aria-expanded') === 'false');
+                    const sectionButton = event.target.closest(
+                        'button[aria-controls^="unit-"]'
+                    );
+                    if (sectionButton) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setSectionState(
+                            sectionButton,
+                            sectionButton.getAttribute('aria-expanded') === 'false'
+                        );
                         return;
                     }
+
+                    const target = event.target.closest('button, a');
+                    if (!target) return;
 
                     const outline = target.closest('nav[aria-label="Course outline"]');
                     if (!outline) return;
@@ -323,7 +461,16 @@ async def main():
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
-        print(f"SUCCESS! Saved working offline bundle to '{output_file}'.")
+        progress_output_file = os.path.join(OUTPUT_DIR, PROGRESS_OUTPUT_FILE)
+        with open(progress_output_file, "w", encoding="utf-8") as f:
+            f.write(str(progress_soup))
+
+        print(
+            "SUCCESS! Saved offline course and progress pages to "
+            f"'{output_file}' and '{progress_output_file}'."
+        )
+        await course_capture.close()
+        await progress_capture.close()
         await browser.close()
 
 
