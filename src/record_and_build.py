@@ -40,6 +40,13 @@ async def main():
             control["href"] = f"./{filename}"
             control["onclick"] = ""
 
+    def link_back_to_course_outline(soup):
+        """Make the progress page's SVG-and-text back control work offline."""
+        for control in soup.select('[aria-label="Back to Course Outline"]'):
+            control.name = "a"
+            control["href"] = f"./{OUTPUT_FILE}"
+            control["onclick"] = ""
+
     async def capture_all_outline_panels(page):
         """Load each lazy sidebar week and retain its rendered lesson panel."""
         outline_buttons = page.locator(
@@ -294,17 +301,26 @@ async def main():
         if soup.head:
             soup.head.append(override_style)
 
-        # 2. The course page has no stable <main> node. Use the right-hand
-        # course card rather than document.body, preserving its sidebar and
-        # header whenever an offline quiz is opened.
+        # 2. The course page has no stable <main> node. Target the inner lesson
+        # area of the right-hand card, not the card itself: its first child
+        # contains the mobile hamburger and assessment header, both of which
+        # must remain visible after an offline quiz is opened.
         container_el = None
         layout_root = soup.select_one(".layout-root")
         if layout_root:
             sidebar_el = layout_root.select_one(":scope > .Sidebar")
+            course_card = None
             for child in layout_root.find_all(recursive=False):
                 if child is not sidebar_el:
-                    container_el = child
+                    course_card = child
                     break
+            if course_card:
+                for child in course_card.find_all(recursive=False):
+                    classes = child.get("class", [])
+                    if "flex-1" in classes and "flex-col" in classes:
+                        container_el = child
+                        break
+                container_el = container_el or course_card
         if container_el is None:
             container_el = soup.select_one(
                 '#course-content, .lesson-container, .main-content, main, [role="main"]'
@@ -313,7 +329,7 @@ async def main():
             container_el["id"] = "nptel-offline-display"
 
         make_file_link(soup, "Course Progress", PROGRESS_OUTPUT_FILE)
-        make_file_link(progress_soup, "← Back to Course Outline", OUTPUT_FILE)
+        link_back_to_course_outline(progress_soup)
 
         # React's progress accordion has no handlers after page.content() is
         # saved. Recreate just its open/close behavior for the standalone file.
