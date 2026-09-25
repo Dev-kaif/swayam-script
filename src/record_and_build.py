@@ -30,16 +30,6 @@ async def main():
     keep_recording = True
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    async def click_visible_text(page, text: str) -> bool:
-        """Click an on-screen control, never a hidden duplicate from the SPA."""
-        locator = page.get_by_text(text, exact=True)
-        for index in range(await locator.count()):
-            candidate = locator.nth(index)
-            if await candidate.is_visible():
-                await candidate.click(timeout=5_000)
-                return True
-        return False
-
     def make_file_link(soup, label: str, filename: str):
         """Turn a captured React-only control into a working local file link."""
         for text_node in soup.find_all(
@@ -81,18 +71,81 @@ async def main():
         print(f"  [+] Captured {len(panels)} sidebar lesson panels.")
         return panels
 
-    def restore_outline_panels(soup, panels):
+    def restore_lazy_panels(soup, panels):
         """Insert lazy React panels that were absent from page.content()."""
         for panel_id, panel_html in panels.items():
-            header = soup.select_one(f'button[aria-controls="{panel_id}"]')
             replacement = BeautifulSoup(panel_html, "html.parser").find()
-            if header is None or replacement is None:
+            if replacement is None:
                 continue
+            header = soup.select_one(f'button[aria-controls="{panel_id}"]')
+            if header is None:
+                labelled_by = replacement.get("aria-labelledby")
+                header = soup.find(id=labelled_by) if labelled_by else None
+            if header is None:
+                continue
+            header["aria-controls"] = panel_id
             existing = soup.find(id=panel_id)
             if existing:
                 existing.replace_with(replacement)
             else:
                 header.insert_after(replacement)
+
+    async def capture_progress_panels_interactively(page):
+        """Save lazy progress panels after the user confirms each is loaded."""
+        panels = {}
+        loop = asyncio.get_running_loop()
+        for label in (
+            "Assignment Scores",
+            "Unit Wise Progress",
+            "Grading and Certifications Policy",
+        ):
+            await loop.run_in_executor(
+                None,
+                input,
+                f"\n>>> In the Progress browser tab, open '{label}', wait for its "
+                "content to load, then press ENTER here... ",
+            )
+            locator = page.locator('button[data-slot="accordion-trigger"]')
+            trigger = None
+            for index in range(await locator.count()):
+                candidate = locator.nth(index)
+                if (
+                    await candidate.is_visible()
+                    and (await candidate.text_content() or "").strip() == label
+                ):
+                    trigger = candidate
+                    break
+            if trigger is None:
+                print(f"  [!] Could not find progress section '{label}'.")
+                continue
+            if await trigger.get_attribute("aria-expanded") != "true":
+                print(f"  [!] '{label}' is still closed; open it before confirming.")
+                continue
+            panel_id = await trigger.get_attribute("aria-controls")
+            try:
+                if panel_id:
+                    panel = page.locator(f"#{panel_id}")
+                else:
+                    trigger_id = await trigger.get_attribute("id")
+                    if not trigger_id:
+                        raise RuntimeError("accordion trigger has no id")
+                    panel = page.locator(
+                        f'[data-slot="accordion-content"][aria-labelledby="{trigger_id}"]'
+                    )
+                await panel.wait_for(state="attached", timeout=5_000)
+                panel_id = await panel.get_attribute("id")
+                if not panel_id:
+                    raise RuntimeError("accordion panel has no id")
+                await page.wait_for_timeout(300)
+                panel_html = await panel.evaluate("element => element.outerHTML")
+                if len(panel_html) < 200:
+                    raise RuntimeError("accordion content was empty")
+                panels[panel_id] = panel_html
+                print(f"  [+] Captured progress section '{label}'.")
+            except Exception as error:
+                print(f"  [!] Could not load progress section '{label}': {error}")
+        print(f"  [+] Captured {len(panels)} progress panels.")
+        return panels
 
     async def background_recorder(page):
         """Polls the browser URL from Python every second to record new quizzes."""
@@ -196,15 +249,19 @@ async def main():
         await progress_capture.get_by_text(
             "Student Progress Report", exact=True
         ).first.wait_for(state="visible", timeout=15_000)
-        # Save scores expanded, so the offline progress page is useful without
-        # relying on the live React accordion handlers.
-        await click_visible_text(progress_capture, "Assignment Scores")
-        await progress_capture.wait_for_timeout(500)
+        await progress_capture.bring_to_front()
+        print("\n" + "=" * 70)
+        print("LIVE PROGRESS CAPTURE MODE ACTIVE:")
+        print("Open each requested section in the Progress browser tab and wait")
+        print("until its real content appears before confirming in this terminal.")
+        print("=" * 70)
+        progress_panels = await capture_progress_panels_interactively(progress_capture)
         progress_raw_html = await progress_capture.content()
 
         soup = BeautifulSoup(raw_html, "html.parser")
-        restore_outline_panels(soup, outline_panels)
+        restore_lazy_panels(soup, outline_panels)
         progress_soup = BeautifulSoup(progress_raw_html, "html.parser")
+        restore_lazy_panels(progress_soup, progress_panels)
 
         # 1. Offline sidebar styling. Do not force collapsed accordions open:
         # it breaks the original responsive layout and creates empty gaps.
@@ -257,6 +314,51 @@ async def main():
 
         make_file_link(soup, "Course Progress", PROGRESS_OUTPUT_FILE)
         make_file_link(progress_soup, "← Back to Course Outline", OUTPUT_FILE)
+
+        # React's progress accordion has no handlers after page.content() is
+        # saved. Recreate just its open/close behavior for the standalone file.
+        progress_router = progress_soup.new_tag("script")
+        progress_router.string = """
+            (() => {
+                function setAccordionState(trigger, isOpen) {
+                    const panel = (trigger.getAttribute('aria-controls')
+                        && document.getElementById(trigger.getAttribute('aria-controls')))
+                        || (trigger.id && document.querySelector(
+                            `[aria-labelledby="${CSS.escape(trigger.id)}"]`
+                        ));
+                    const item = trigger.closest('[data-slot="accordion-item"]');
+                    trigger.setAttribute('aria-expanded', String(isOpen));
+                    trigger.setAttribute('data-state', isOpen ? 'open' : 'closed');
+                    item?.setAttribute('data-state', isOpen ? 'open' : 'closed');
+                    if (panel) {
+                        trigger.setAttribute('aria-controls', panel.id);
+                        panel.hidden = !isOpen;
+                        panel.style.display = isOpen ? '' : 'none';
+                        panel.setAttribute('data-state', isOpen ? 'open' : 'closed');
+                    }
+                }
+
+                document.addEventListener('click', event => {
+                    const trigger = event.target.closest(
+                        'button[data-slot="accordion-trigger"]'
+                    );
+                    if (!trigger) return;
+                    event.preventDefault();
+                    setAccordionState(
+                        trigger,
+                        trigger.getAttribute('aria-expanded') !== 'true'
+                    );
+                });
+
+                // Content is saved for every section, but the standalone page
+                // should start compact just like the live progress page.
+                document.querySelectorAll(
+                    'button[data-slot="accordion-trigger"]'
+                ).forEach(trigger => setAccordionState(trigger, false));
+            })();
+        """
+        if progress_soup.body:
+            progress_soup.body.append(progress_router)
 
         # 3. Local CSS Asset Downloader
         assets_dir = os.path.join(OUTPUT_DIR, "assets")
